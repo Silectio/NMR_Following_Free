@@ -1,4 +1,5 @@
 import json, io, gc, numpy as np, pandas as pd, streamlit as st
+import altair as alt
 
 try:
     from numerapi import NumerAPI
@@ -901,7 +902,92 @@ with T2:
         with c2:
             st.markdown("Histogramme")
             if len(hist_df) > 0:
-                st.bar_chart(hist_df.set_index("bin_mid")["count"])
+                # Définir un domaine X qui inclut 0 pour afficher une règle verticale à x=0
+                x_min = float(hist_df["bin_left"].min())
+                x_max = float(hist_df["bin_right"].max())
+                dom_min = min(x_min, 1.0)
+                dom_max = max(x_max, 1.0)
+
+                hist_chart = (
+                    alt.Chart(hist_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X(
+                            "bin_mid:Q",
+                            title="season_score_payout",
+                            scale=alt.Scale(domain=[dom_min, dom_max]),
+                        ),
+                        y=alt.Y("count:Q", title="Nombre"),
+                        tooltip=[
+                            alt.Tooltip("bin_left:Q", title="Bin gauche"),
+                            alt.Tooltip("bin_right:Q", title="Bin droite"),
+                            alt.Tooltip("count:Q", title="Compte"),
+                        ],
+                    )
+                )
+                vline = (
+                    alt.Chart(pd.DataFrame({"x": [1.0]}))
+                    .mark_rule(color="red")
+                    .encode(x="x:Q")
+                )
+                st.altair_chart(hist_chart + vline, use_container_width=True)
+
+                # Courbe de densité (KDE) basée sur la série brute
+                ssp_clean = ssp.dropna().astype(float)
+                if ssp_clean.size > 1:
+                    df_kde = pd.DataFrame({"ssp": ssp_clean.to_numpy()})
+                    kde_chart = (
+                        alt.Chart(df_kde)
+                        .transform_density(
+                            "ssp",
+                            as_=["ssp", "density"],
+                            extent=[float(ssp_clean.min()), float(ssp_clean.max())],
+                            steps=200,
+                        )
+                        .mark_line(color="orange")
+                        .encode(
+                            x=alt.X("ssp:Q", title="season_score_payout"),
+                            y=alt.Y("density:Q", title="Densité"),
+                        )
+                    )
+                    st.altair_chart(kde_chart, use_container_width=True)
+
+                    # Panneau d'échantillonnage depuis la distribution empirique
+                    with st.expander("Échantillonnage empirique"):
+                        c3, c4 = st.columns(2)
+                        sample_n = int(
+                            c3.number_input(
+                                "Taille de l'échantillon", 10, 100000, 1000, 100
+                            )
+                        )
+                        sample_seed = int(
+                            c4.number_input("Seed (sample)", 0, 2**32 - 1, 42)
+                        )
+                        rng_s = np.random.default_rng(sample_seed)
+                        sample = rng_s.choice(
+                            ssp_clean.to_numpy(), size=sample_n, replace=True
+                        )
+                        # Mini-histogramme de l'échantillon
+                        shist_df = make_hist(pd.Series(sample), bins=20)
+                        schart = (
+                            alt.Chart(shist_df)
+                            .mark_bar(color="#4C78A8")
+                            .encode(
+                                x=alt.X("bin_mid:Q", title="Échantillon (ssp)"),
+                                y=alt.Y("count:Q", title="Nombre"),
+                                tooltip=[
+                                    alt.Tooltip("bin_left:Q", title="Bin gauche"),
+                                    alt.Tooltip("bin_right:Q", title="Bin droite"),
+                                    alt.Tooltip("count:Q", title="Compte"),
+                                ],
+                            )
+                        )
+                        st.altair_chart(schart, use_container_width=True)
+                        # Stats rapides
+                        c5, c6, c7 = st.columns(3)
+                        c5.metric("Moyenne", f"{float(np.mean(sample)):.5f}")
+                        c6.metric("Médiane", f"{float(np.median(sample)):.5f}")
+                        c7.metric("Écart-type", f"{float(np.std(sample, ddof=1)):.5f}")
             else:
                 st.info("Pas de données pour l'histogramme.")
     else:
