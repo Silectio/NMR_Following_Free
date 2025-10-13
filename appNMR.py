@@ -1,5 +1,9 @@
 import json, io, gc, numpy as np, pandas as pd, streamlit as st
-from numerapi import NumerAPI
+
+try:
+    from numerapi import NumerAPI
+except Exception:  # fallback pour environnements où l'API est exposée différemment
+    from numerapi.numerapi import NumerAPI
 
 st.set_page_config(page_title="Analyse Modèle Numerai", layout="wide")
 st.title("Analyse Modèle Numerai")
@@ -359,8 +363,12 @@ def bisection_irr_stream(
         disc = 1.0
         one_plus_r = 1.0 + r
         total = -float(initial_balance)  # t=0
+        tiny = float(np.finfo(float).tiny)
         for t in range(1, L):
             disc *= one_plus_r
+            # Protection contre l'underflow qui pourrait rendre disc==0.0
+            if not np.isfinite(disc) or abs(disc) < tiny:
+                disc = tiny
             cf = 0.0
             if (t >= ss) and (t <= stp) and (t % max(1, contrib_every) == 0):
                 cf = -float(
@@ -371,6 +379,8 @@ def bisection_irr_stream(
         # t=L
         if L >= 1:
             disc *= one_plus_r
+            if not np.isfinite(disc) or abs(disc) < tiny:
+                disc = tiny
             cf_L = -float(
                 (
                     contrib_amount
@@ -675,7 +685,6 @@ with st.sidebar:
     st.header("Source")
     source = st.radio("Données", ["API", "Upload JSON"], index=0)
     resolved_only = st.checkbox("Rounds résolus uniquement", value=False)
-    strict_mem = st.checkbox("Mode mémoire stricte", value=False)
     st.header("Paramètres de simulation")
     L = st.number_input("Longueur L", 10, 10000, 750, 10)
     n_paths = st.number_input("n_paths", 1, 5000, 100, 10)
@@ -783,7 +792,7 @@ rounds_in = st.session_state["rounds"] if source == "API" else all_rounds
 long_df = build_long_df(rounds_in)
 
 # Filtre optionnel: ne garder que les rounds dont roundResolveTime est passé
-if "resolved_only" in locals() and resolved_only:
+if resolved_only:
     now = pd.Timestamp.utcnow().tz_localize(None)
     if "roundResolveTime" in long_df.columns:
         long_df = long_df[long_df["roundResolveTime"].notna()]
@@ -813,15 +822,17 @@ index_cols = [
     "roundPayoutFactor",
     "atRisk",
 ]
-values_df = base.pivot_table(
-    index=index_cols, columns="displayName", values="value", aggfunc="first"
+# Tri + déduplication pour garder la première observation par (index_cols, displayName)
+_tmp = base.sort_values(index_cols + ["displayName"]).drop_duplicates(
+    index_cols + ["displayName"], keep="first"
+)
+# Pivot sans agrégation (évite le produit cartésien)
+values_df = _tmp.pivot(
+    index=index_cols, columns="displayName", values="value"
 ).reset_index()
-percentiles_df = base.pivot_table(
-    index=index_cols, columns="displayName", values="percentile", aggfunc="first"
+percentiles_df = _tmp.pivot(
+    index=index_cols, columns="displayName", values="percentile"
 ).reset_index()
-values_df = values_df[
-    index_cols + sorted([c for c in values_df.columns if c not in index_cols])
-]
 for c in values_df.columns:
     if c in ("roundPayoutFactor", "atRisk"):
         values_df[c] = pd.to_numeric(values_df[c], errors="coerce").astype("float32")
@@ -853,11 +864,13 @@ if (season_col is not None) and ("roundPayoutFactor" in values_df.columns):
     )
 
 st.success(
-    f"Rounds analysés: {len(keep)} | De {values_df['roundDate'].min()} à {values_df['roundDate'].max()}"
+    f"✅ **Analyse terminée** - Rounds analysés: {len(keep)} | "
+    f"Période: {values_df['roundDate'].min().strftime('%Y-%m-%d') if pd.notna(values_df['roundDate'].min()) else 'N/A'} → "
+    f"{values_df['roundDate'].max().strftime('%Y-%m-%d') if pd.notna(values_df['roundDate'].max()) else 'N/A'}"
 )
 
 T5, T1, T2, T3, T4 = st.tabs(
-    ["Résumé", "Données", "Distribution", "Simulations", "Cash sim"]
+    ["📊 Résumé", "📋 Données", "📈 Distribution", "🎲 Simulations", "💰 Cash sim"]
 )
 
 with T1:
@@ -866,18 +879,14 @@ with T1:
     st.subheader("Percentiles")
     st.dataframe(percentiles_df.head(int(max_rows_show)), use_container_width=True)
     st.subheader("Long (raw)")
-    if not strict_mem:
-        st.dataframe(long_df.head(int(max_rows_show)), use_container_width=True)
-    else:
-        st.info("Mode mémoire stricte: raw long_df non affiché.")
+    st.dataframe(long_df.head(int(max_rows_show)), use_container_width=True)
 
-# Libération mémoire si strict_mem
-if strict_mem:
-    try:
-        del base
-    except Exception:
-        pass
-    gc.collect()
+# Libération mémoire
+try:
+    del base
+except Exception:
+    pass
+gc.collect()
 
 with T2:
     st.subheader("Distribution de season_score_payout")
@@ -910,20 +919,30 @@ with T3:
         )
     else:
         try:
-            horizons = [int(x) for x in horizons_txt.split(",") if str(x).strip() != ""]
+            horizons = [
+                int(x.strip()) for x in horizons_txt.split(",") if x.strip().isdigit()
+            ]
+            if not horizons:  # Si la liste est vide après parsing
+                horizons = [4, 8, 12, 20, 40, 60, 120, 250, 375, 500, 750]
         except Exception:
-            horizons = [4, 12, 26, 52, 150, 365, 720]
+            horizons = [4, 8, 12, 20, 40, 60, 120, 250, 375, 500, 750]
         seed = st.number_input("Seed RNG", 0, 2**32 - 1, 0)
         rng = np.random.default_rng(int(seed))
         with st.spinner("Simulation de trajectoires..."):
             n_paths_eff = int(min(int(n_paths), int(n_paths_plot)))
             paths_df = simulate_paths(ssp, int(L), n_paths_eff, rng)
         st.caption(f"Trajectoires générées: {paths_df.shape[1]-1} | Longueur: {int(L)}")
+
+        # Préparer les données pour le graphique
         plot_cols = ["step"] + [c for c in paths_df.columns[1 : 1 + int(n_paths_plot)]]
-        plot_df = paths_df[plot_cols]
+        plot_df = paths_df[plot_cols].copy()
         if int(plot_every) > 1:
             plot_df = plot_df.iloc[:: int(plot_every), :]
+
+        # Afficher le graphique
         st.line_chart(plot_df.set_index("step"))
+
+        # Nettoyage mémoire
         del paths_df, plot_df
         gc.collect()
         with st.spinner("Stats terminales par horizon..."):
@@ -941,14 +960,16 @@ with T4:
         st.warning("Aucune donnée de season_score_payout pour la simulation de cash.")
     else:
         try:
-            horizons = [int(x) for x in horizons_txt.split(",") if str(x).strip() != ""]
+            horizons = [
+                int(x.strip()) for x in horizons_txt.split(",") if x.strip().isdigit()
+            ]
+            if not horizons:  # Si la liste est vide après parsing
+                horizons = [4, 8, 12, 20, 40, 60, 120, 250, 375, 500, 750]
         except Exception:
-            horizons = [4, 12, 26, 52, 150, 365, 720]
+            horizons = [4, 8, 12, 20, 40, 60, 120, 250, 375, 500, 750]
         seed2 = st.number_input("Seed RNG (cash sim)", 0, 2**32 - 1, 1)
         rng2 = np.random.default_rng(int(seed2))
-        show_details = st.checkbox(
-            "Détails complets (gourmand en mémoire)", value=False
-        )
+        show_details = st.checkbox("Afficher les détails complets", value=False)
         sel_idx = max(1, min(int(n_paths), int(selected_path)))
         # Génère uniquement la trajectoire sélectionnée pour économiser la mémoire
         rng_path = np.random.default_rng(int(seed2) + int(sel_idx) - 1)
@@ -990,19 +1011,20 @@ with T4:
                 pd.DataFrame(list(metrics.items()), columns=["metric", "value"])
             )
         with st.expander("Données détaillées (cash sim)"):
-            if sim_df is not None:
-                st.dataframe(sim_df, use_container_width=True)
+            if sim_df is not None and show_details:
+                st.dataframe(sim_df.head(int(max_rows_show)), use_container_width=True)
+            elif sim_df is not None:
+                st.info(
+                    "Activez 'Afficher les détails complets' pour voir le DataFrame détaillé."
+                )
             else:
-                st.info("Mode mémoire maximale: pas de DataFrame détaillé.")
-        # Libération mémoire si mode strict
-        if "strict_mem" in locals() and strict_mem:
-            try:
-                del sim_df, path
-            except Exception:
-                pass
-            import gc as _gc
-
-            _gc.collect()
+                st.info("Aucune donnée détaillée disponible.")
+        # Libération mémoire
+        try:
+            del path
+        except Exception:
+            pass
+        gc.collect()
 
 with T5:
     st.subheader("Résumé")
@@ -1131,6 +1153,7 @@ with T5:
                 )
 
 st.caption(
-    "Import via JSON ou directement depuis l'API Numerai. Les appels API restent en cache tant que tu ne cliques pas Refresh."
+    "💡 **Conseils d'utilisation :** Import via JSON ou directement depuis l'API Numerai. "
+    "Les appels API restent en cache tant que vous ne cliquez pas sur Refresh. "
+    "Pour les simulations longues, utilisez un nombre de trajectoires raisonnable."
 )
-
