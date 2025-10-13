@@ -675,7 +675,7 @@ with st.sidebar:
     st.header("Source")
     source = st.radio("Données", ["API", "Upload JSON"], index=0)
     resolved_only = st.checkbox("Rounds résolus uniquement", value=False)
-    strict_mem = st.checkbox("Mode mémoire stricte", value=True)
+    strict_mem = st.checkbox("Mode mémoire stricte", value=False)
     st.header("Paramètres de simulation")
     L = st.number_input("Longueur L", 10, 10000, 750, 10)
     n_paths = st.number_input("n_paths", 1, 5000, 100, 10)
@@ -1133,3 +1133,4 @@ with T5:
 st.caption(
     "Import via JSON ou directement depuis l'API Numerai. Les appels API restent en cache tant que tu ne cliques pas Refresh."
 )
+
