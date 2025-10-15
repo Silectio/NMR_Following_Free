@@ -1,5 +1,7 @@
 import json, io, gc, numpy as np, pandas as pd, streamlit as st
 import altair as alt
+import plotly.express as px
+import plotly.graph_objects as go
 
 try:
     from numerapi.numerapi import NumerAPI
@@ -693,34 +695,20 @@ def create_time_series_chart(
     df, metric_col, metric_name, date_col="roundDate", ma_window=20
 ):
     """
-    Crée un graphique temporel avec moyenne mobile pour une métrique donnée.
-
-    Args:
-        df: DataFrame contenant les données
-        metric_col: nom de la colonne de la métrique
-        metric_name: nom affiché pour la métrique
-        date_col: nom de la colonne de date
-        ma_window: fenêtre pour la moyenne mobile
+    Graphique temporel Plotly avec moyenne mobile et ligne de référence.
     """
     if metric_col not in df.columns or date_col not in df.columns:
         return None
 
-    # Préparer les données
-    chart_df = df[[date_col, metric_col]].copy()
-    chart_df = chart_df.dropna()
-
+    chart_df = df[[date_col, metric_col]].copy().dropna()
     if len(chart_df) == 0:
         return None
 
-    # Trier par date
     chart_df = chart_df.sort_values(date_col)
-
-    # Calculer la moyenne mobile
     chart_df[f"{metric_col}_ma"] = (
         chart_df[metric_col].rolling(window=ma_window, min_periods=1).mean()
     )
 
-    # Renommer les colonnes pour l'affichage
     chart_df = chart_df.rename(
         columns={
             metric_col: f"{metric_name}",
@@ -728,7 +716,6 @@ def create_time_series_chart(
         }
     )
 
-    # Reshape pour Altair
     melted_df = pd.melt(
         chart_df,
         id_vars=[date_col],
@@ -737,49 +724,23 @@ def create_time_series_chart(
         value_name="Valeur",
     )
 
-    # Créer le graphique
-    chart = (
-        alt.Chart(melted_df)
-        .mark_line()
-        .encode(
-            x=alt.X(f"{date_col}:T", title="Date"),
-            y=alt.Y("Valeur:Q", title=metric_name),
-            color=alt.Color(
-                "Série:N",
-                scale=alt.Scale(
-                    domain=[f"{metric_name}", f"{metric_name} (MA{ma_window})"],
-                    range=["#1f77b4", "#ff7f0e"],
-                ),
-            ),
-            tooltip=[
-                alt.Tooltip(f"{date_col}:T", title="Date"),
-                alt.Tooltip("Série:N", title="Série"),
-                alt.Tooltip("Valeur:Q", title="Valeur", format=".4f"),
-            ],
-        )
-        .properties(
-            width=700, height=300, title=f"Évolution temporelle - {metric_name}"
-        )
-        .resolve_scale(color="independent")
+    fig = px.line(
+        melted_df,
+        x=date_col,
+        y="Valeur",
+        color="Série",
+        title=f"Évolution temporelle - {metric_name}",
     )
+    fig.update_traces(hovertemplate="Date=%{x|%Y-%m-%d}<br>%{legendgroup}: %{y:.4f}")
+    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), legend_title_text="Série")
 
-    # Ajouter une ligne de référence à 0 si approprié
+    # Ligne de référence
     if metric_name in ["CORRv2", "MMC"]:
-        ref_line = (
-            alt.Chart(pd.DataFrame({"y": [0]}))
-            .mark_rule(color="red", strokeDash=[5, 5])
-            .encode(y="y:Q")
-        )
-        chart = chart + ref_line
+        fig.add_hline(y=0, line_dash="dash", line_color="red")
     elif metric_name == "Season Score Payout":
-        ref_line = (
-            alt.Chart(pd.DataFrame({"y": [1]}))
-            .mark_rule(color="red", strokeDash=[5, 5])
-            .encode(y="y:Q")
-        )
-        chart = chart + ref_line
+        fig.add_hline(y=1, line_dash="dash", line_color="red")
 
-    return chart
+    return fig
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -1021,55 +982,53 @@ with T2:
         with c2:
             st.markdown("Histogramme")
             if len(hist_df) > 0:
-                # Définir un domaine X qui inclut 0 pour afficher une règle verticale à x=0
+                # Définir un domaine X qui inclut 1.0 pour afficher une ligne verticale à x=1.0
                 x_min = float(hist_df["bin_left"].min())
                 x_max = float(hist_df["bin_right"].max())
                 dom_min = min(x_min, 1.0)
                 dom_max = max(x_max, 1.0)
 
-                hist_chart = (
-                    alt.Chart(hist_df)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X(
-                            "bin_mid:Q",
-                            title="season_score_payout",
-                            scale=alt.Scale(domain=[dom_min, dom_max]),
-                        ),
-                        y=alt.Y("count:Q", title="Nombre"),
-                        tooltip=[
-                            alt.Tooltip("bin_left:Q", title="Bin gauche"),
-                            alt.Tooltip("bin_right:Q", title="Bin droite"),
-                            alt.Tooltip("count:Q", title="Compte"),
-                        ],
-                    )
+                # Histogramme Plotly
+                fig_hist = px.bar(
+                    hist_df,
+                    x="bin_mid",
+                    y="count",
+                    hover_data={"bin_left": ":.5f", "bin_right": ":.5f", "count": True},
+                    title="Histogramme",
+                    labels={"bin_mid": "season_score_payout", "count": "Nombre"},
                 )
-                vline = (
-                    alt.Chart(pd.DataFrame({"x": [1.0]}))
-                    .mark_rule(color="red")
-                    .encode(x="x:Q")
+                fig_hist.update_layout(
+                    margin=dict(l=10, r=10, t=30, b=10), showlegend=False
                 )
-                st.altair_chart(hist_chart + vline, use_container_width=True)
+                fig_hist.update_xaxes(range=[dom_min, dom_max])
+                fig_hist.add_vline(x=1.0, line_color="red")
+                st.plotly_chart(fig_hist, use_container_width=True)
 
-                # Courbe de densité (KDE) basée sur la série brute
+                # Courbe de densité approximative (à partir d’un histogramme densité)
                 ssp_clean = ssp.dropna().astype(float)
                 if ssp_clean.size > 1:
-                    df_kde = pd.DataFrame({"ssp": ssp_clean.to_numpy()})
-                    kde_chart = (
-                        alt.Chart(df_kde)
-                        .transform_density(
-                            "ssp",
-                            as_=["ssp", "density"],
-                            extent=[float(ssp_clean.min()), float(ssp_clean.max())],
-                            steps=200,
-                        )
-                        .mark_line(color="orange")
-                        .encode(
-                            x=alt.X("ssp:Q", title="season_score_payout"),
-                            y=alt.Y("density:Q", title="Densité"),
+                    counts, edges = np.histogram(
+                        ssp_clean.to_numpy(), bins=60, density=True
+                    )
+                    mids = (edges[:-1] + edges[1:]) / 2.0
+                    fig_kde = go.Figure()
+                    fig_kde.add_trace(
+                        go.Scatter(
+                            x=mids,
+                            y=counts,
+                            mode="lines",
+                            line=dict(color="orange"),
+                            name="Densité (approx)",
                         )
                     )
-                    st.altair_chart(kde_chart, use_container_width=True)
+                    fig_kde.update_layout(
+                        title="Densité (approximation)",
+                        xaxis_title="season_score_payout",
+                        yaxis_title="Densité",
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_kde, use_container_width=True)
 
                     # Panneau d'échantillonnage depuis la distribution empirique
                     with st.expander("Échantillonnage empirique"):
@@ -1086,22 +1045,18 @@ with T2:
                         sample = rng_s.choice(
                             ssp_clean.to_numpy(), size=sample_n, replace=True
                         )
-                        # Mini-histogramme de l'échantillon
+                        # Mini-histogramme de l'échantillon (Plotly)
                         shist_df = make_hist(pd.Series(sample), bins=20)
-                        schart = (
-                            alt.Chart(shist_df)
-                            .mark_bar(color="#4C78A8")
-                            .encode(
-                                x=alt.X("bin_mid:Q", title="Échantillon (ssp)"),
-                                y=alt.Y("count:Q", title="Nombre"),
-                                tooltip=[
-                                    alt.Tooltip("bin_left:Q", title="Bin gauche"),
-                                    alt.Tooltip("bin_right:Q", title="Bin droite"),
-                                    alt.Tooltip("count:Q", title="Compte"),
-                                ],
-                            )
+                        fig_samp = px.bar(
+                            shist_df,
+                            x="bin_mid",
+                            y="count",
+                            labels={"bin_mid": "Échantillon (ssp)", "count": "Nombre"},
                         )
-                        st.altair_chart(schart, use_container_width=True)
+                        fig_samp.update_layout(
+                            margin=dict(l=10, r=10, t=30, b=10), showlegend=False
+                        )
+                        st.plotly_chart(fig_samp, use_container_width=True)
                         # Stats rapides
                         c5, c6, c7 = st.columns(3)
                         c5.metric("Moyenne", f"{float(np.mean(sample)):.5f}")
@@ -1162,7 +1117,7 @@ with T6:
             )
 
             if chart is not None:
-                st.altair_chart(chart, use_container_width=True)
+                st.plotly_chart(chart, use_container_width=True)
 
                 # Statistiques rapides
                 metric_data = pd.to_numeric(
