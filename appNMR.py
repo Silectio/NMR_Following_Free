@@ -2,12 +2,31 @@ import json, io, gc, numpy as np, pandas as pd, streamlit as st
 import altair as alt
 
 try:
-    from numerapi import NumerAPI
-except Exception:  # fallback pour environnements où l'API est exposée différemment
     from numerapi.numerapi import NumerAPI
+except Exception:  # fallback pour environnements où l'API est exposée différemment
+    from numerapi import NumerAPI
 
 st.set_page_config(page_title="Analyse Modèle Numerai", layout="wide")
 st.title("Analyse Modèle Numerai")
+
+# --- Patch de secours pour st.dataframe (pyarrow/numpy peut échouer à l'import) ---
+try:
+    _st_dataframe_orig = st.dataframe
+
+    def _st_dataframe_safe(*args, **kwargs):
+        try:
+            return _st_dataframe_orig(*args, **kwargs)
+        except Exception as e:
+            st.warning(f"Affichage simplifié (pyarrow/numpy indisponible): {e}")
+            try:
+                obj = args[0] if args else None
+                return st.write(obj)
+            except Exception:
+                return st.text("[Erreur d'affichage du DataFrame]")
+
+    st.dataframe = _st_dataframe_safe
+except Exception:
+    pass
 
 QUERY_V2 = """
 query($modelId: String!) {
@@ -670,6 +689,99 @@ def cash_sim_from_path(
     return df, metrics
 
 
+def create_time_series_chart(
+    df, metric_col, metric_name, date_col="roundDate", ma_window=20
+):
+    """
+    Crée un graphique temporel avec moyenne mobile pour une métrique donnée.
+
+    Args:
+        df: DataFrame contenant les données
+        metric_col: nom de la colonne de la métrique
+        metric_name: nom affiché pour la métrique
+        date_col: nom de la colonne de date
+        ma_window: fenêtre pour la moyenne mobile
+    """
+    if metric_col not in df.columns or date_col not in df.columns:
+        return None
+
+    # Préparer les données
+    chart_df = df[[date_col, metric_col]].copy()
+    chart_df = chart_df.dropna()
+
+    if len(chart_df) == 0:
+        return None
+
+    # Trier par date
+    chart_df = chart_df.sort_values(date_col)
+
+    # Calculer la moyenne mobile
+    chart_df[f"{metric_col}_ma"] = (
+        chart_df[metric_col].rolling(window=ma_window, min_periods=1).mean()
+    )
+
+    # Renommer les colonnes pour l'affichage
+    chart_df = chart_df.rename(
+        columns={
+            metric_col: f"{metric_name}",
+            f"{metric_col}_ma": f"{metric_name} (MA{ma_window})",
+        }
+    )
+
+    # Reshape pour Altair
+    melted_df = pd.melt(
+        chart_df,
+        id_vars=[date_col],
+        value_vars=[f"{metric_name}", f"{metric_name} (MA{ma_window})"],
+        var_name="Série",
+        value_name="Valeur",
+    )
+
+    # Créer le graphique
+    chart = (
+        alt.Chart(melted_df)
+        .mark_line()
+        .encode(
+            x=alt.X(f"{date_col}:T", title="Date"),
+            y=alt.Y("Valeur:Q", title=metric_name),
+            color=alt.Color(
+                "Série:N",
+                scale=alt.Scale(
+                    domain=[f"{metric_name}", f"{metric_name} (MA{ma_window})"],
+                    range=["#1f77b4", "#ff7f0e"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip(f"{date_col}:T", title="Date"),
+                alt.Tooltip("Série:N", title="Série"),
+                alt.Tooltip("Valeur:Q", title="Valeur", format=".4f"),
+            ],
+        )
+        .properties(
+            width=700, height=300, title=f"Évolution temporelle - {metric_name}"
+        )
+        .resolve_scale(color="independent")
+    )
+
+    # Ajouter une ligne de référence à 0 si approprié
+    if metric_name in ["CORRv2", "MMC"]:
+        ref_line = (
+            alt.Chart(pd.DataFrame({"y": [0]}))
+            .mark_rule(color="red", strokeDash=[5, 5])
+            .encode(y="y:Q")
+        )
+        chart = chart + ref_line
+    elif metric_name == "Season Score Payout":
+        ref_line = (
+            alt.Chart(pd.DataFrame({"y": [1]}))
+            .mark_rule(color="red", strokeDash=[5, 5])
+            .encode(y="y:Q")
+        )
+        chart = chart + ref_line
+
+    return chart
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def get_models_cached(pub, sec):
     return NumerAPI(public_id=pub, secret_key=sec).get_models()
@@ -870,8 +982,15 @@ st.success(
     f"{values_df['roundDate'].max().strftime('%Y-%m-%d') if pd.notna(values_df['roundDate'].max()) else 'N/A'}"
 )
 
-T5, T1, T2, T3, T4 = st.tabs(
-    ["📊 Résumé", "📋 Données", "📈 Distribution", "🎲 Simulations", "💰 Cash sim"]
+T5, T1, T2, T6, T3, T4 = st.tabs(
+    [
+        "📊 Résumé",
+        "📋 Données",
+        "📈 Distribution",
+        "📈 Évolution Temporelle",
+        "🎲 Simulations",
+        "💰 Cash sim",
+    ]
 )
 
 with T1:
@@ -990,10 +1109,87 @@ with T2:
                         c7.metric("Écart-type", f"{float(np.std(sample, ddof=1)):.5f}")
             else:
                 st.info("Pas de données pour l'histogramme.")
+
+with T6:
+    st.subheader("Évolution temporelle des métriques")
+
+    # Paramètres de la moyenne mobile
+    ma_window = st.slider("Fenêtre moyenne mobile (jours)", 5, 100, 20, 5)
+
+    # Vérifier quelles colonnes sont disponibles
+    available_metrics = []
+    metric_mapping = {}
+
+    # Season Score Payout
+    if "season_score_payout" in values_df.columns:
+        available_metrics.append("Season Score Payout")
+        metric_mapping["Season Score Payout"] = "season_score_payout"
+
+    # Rechercher CORRv2
+    corr_cols = [
+        col
+        for col in values_df.columns
+        if "corr" in str(col).lower() and "v2" in str(col).lower()
+    ]
+    if corr_cols:
+        available_metrics.append("CORRv2")
+        metric_mapping["CORRv2"] = corr_cols[0]
+
+    # Rechercher MMC
+    mmc_cols = [col for col in values_df.columns if "mmc" in str(col).lower()]
+    if mmc_cols:
+        available_metrics.append("MMC")
+        metric_mapping["MMC"] = mmc_cols[0]
+
+    if not available_metrics:
+        st.warning("Aucune métrique disponible pour les graphiques temporels.")
     else:
-        st.info(
-            "season_score_payout non disponible (colonne season_score introuvable)."
-        )
+        st.info(f"Métriques disponibles: {', '.join(available_metrics)}")
+
+        # Créer les graphiques pour chaque métrique disponible
+        for metric_name in available_metrics:
+            metric_col = metric_mapping[metric_name]
+
+            st.markdown(f"### {metric_name}")
+
+            # Créer le graphique
+            chart = create_time_series_chart(
+                values_df,
+                metric_col,
+                metric_name,
+                date_col="roundDate",
+                ma_window=ma_window,
+            )
+
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True)
+
+                # Statistiques rapides
+                metric_data = pd.to_numeric(
+                    values_df[metric_col], errors="coerce"
+                ).dropna()
+                if len(metric_data) > 0:
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Moyenne", f"{metric_data.mean():.4f}")
+                    with col2:
+                        st.metric("Médiane", f"{metric_data.median():.4f}")
+                    with col3:
+                        st.metric("Écart-type", f"{metric_data.std():.4f}")
+                    with col4:
+                        # Calculer la moyenne mobile récente
+                        recent_data = values_df.sort_values("roundDate").tail(
+                            ma_window
+                        )[metric_col]
+                        recent_ma = pd.to_numeric(recent_data, errors="coerce").mean()
+                        if not pd.isna(recent_ma):
+                            st.metric(f"MA{ma_window} récente", f"{recent_ma:.4f}")
+                        else:
+                            st.metric(f"MA{ma_window} récente", "N/A")
+            else:
+                st.warning(f"Impossible de créer le graphique pour {metric_name}")
+
+            st.divider()
 
 with T3:
     st.subheader("Trajectoires simulées et stats terminales")
@@ -1129,6 +1325,8 @@ with T5:
             labels = ["80%", "90%", "95%", "97.5%", "99%"]
             idx_default = 2
             sel_label = st.selectbox("Niveau de confiance", labels, index=idx_default)
+            if sel_label is None:
+                sel_label = labels[idx_default]
             level = levels[labels.index(sel_label)]
             z_map = {
                 0.80: 1.2816,
