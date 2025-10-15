@@ -3,3 +3,4 @@ pandas>=1.5,<3
 numpy>=1.23
 openpyxl>=3.1
 numerapi
+plotly
